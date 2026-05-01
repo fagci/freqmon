@@ -1,0 +1,16 @@
+# Frequency plan: start_mhz end_mhz Name
+0.1 0.3 LW
+0.3 3 MW/BC
+3 30 HF
+50 54 50MHz
+88 108 FM Bcast
+118 137 Air
+137 144 Satcom
+144 148 2m
+148 174 148-174
+230 270 Satcom
+300 308 300-308
+400 470 400-470
+420 450 70cm
+880 960 GSM900
+1710 1880 GSM1800

@@ -16,33 +16,37 @@
 #include <liquid/liquid.h>
 #include <rtl-sdr.h>
 
+#include "ui.h"
+
 // === Константы ===
 constexpr size_t FFT_SIZE = 8192;
 constexpr uint32_t SAMPLE_RATE = 2400000;
-constexpr int INITIAL_GAIN = 439;
 constexpr int WINDOW_WIDTH = 1024;
 constexpr int WINDOW_HEIGHT = 768;
 constexpr int SPECTRUM_HEIGHT = 200;
 constexpr int WATERFALL_HEIGHT = 350;
 constexpr int SCALE_HEIGHT = 50;
+constexpr int BAND_ZONE_HEIGHT = 16;
 constexpr int PIP_WIDTH = 200;
 constexpr int PIP_HEIGHT = 100;
-constexpr float MIN_DB = -65.0f;
-constexpr float MAX_DB = -15.0f;
-constexpr double OVERLAP = 0.25;
 constexpr double SCAN_START_FREQ = 0.0;
 constexpr double SCAN_END_FREQ = 1'800'000'000.0;
 constexpr double MIN_SPAN = 1e6;
-constexpr double SCAN_STEP = SAMPLE_RATE * (1.0 - OVERLAP * 2.0);
 constexpr size_t RING_BUFFER_SIZE = 16 * 1024 * 1024;
 constexpr size_t TEXT_CACHE_MAX = 512;
 constexpr float PEAK_DECAY_DB = 0.05f;
 constexpr Uint32 FRAME_MS = 16;
 constexpr int MAX_FFT_PER_FRAME = 8;
 
-// Очистка спектра
-constexpr float EDGE_REJECT_FRAC = 0.10f;    // отбрасываем по 10% с краёв FFT (roll-off)
-constexpr float SMOOTH_ALPHA = 0.4f;         // коэф. IIR между циклами (0=медленно, 1=нет сглаживания)
+// === Runtime-параметры (настраиваются через UI) ===
+float display_min_db = -65.0f;
+float display_max_db = -40.0f;
+float edge_reject_frac = 0.10f;
+float smooth_alpha = 0.4f;
+double overlap = 0.25;
+int window_type = 0; // 0=Hann, 1=Hamming, 2=Blackman, 3=Blackman-Harris, 4=Kaiser
+
+double scan_step() { return SAMPLE_RATE * (1.0 - overlap * 2.0); }
 
 // Детекция сигналов (CFAR)
 constexpr int CFAR_WIN_HALF = 30;            // полуширина опорного окна, px
@@ -58,22 +62,60 @@ struct Band {
   std::string name;
   double start_hz;
   double end_hz;
+  SDL_Color color;
 };
 
-std::vector<Band> bands = {
-    {"LW", 100000.0, 300000.0},
-    {"MW", 300000.0, 3000000.0},
-    {"HF (3-30)", 3000000.0, 30000000.0},
-    {"CB", 27000000.0, 27400000.0},
-    {"11m", 25600000.0, 26100000.0},
-    {"10m", 28000000.0, 29700000.0},
-    {"FM Bcast", 88000000.0, 108000000.0},
-    {"2m", 144000000.0, 148000000.0},
-    {"148-176", 148'000'000.0, 176'000'000.0},
-    {"SAT", 230000000.0, 270000000.0},
-    {"400-470", 400000000.0, 470000000.0},
-    {"23cm", 1240000000.0, 1300000000.0},
+static SDL_Color band_colors[] = {
+  {255, 80, 80, 255},   // красный
+  {255, 160, 40, 255},  // оранжевый
+  {255, 220, 60, 255},  // жёлтый
+  {120, 230, 140, 255}, // зелёный
+  {100, 200, 255, 255}, // голубой
+  {160, 120, 255, 255}, // фиолетовый
+  {255, 100, 200, 255}, // розовый
+  {180, 230, 100, 255}, // салатовый
+  {200, 180, 140, 255}, // коричневый
+  {140, 220, 200, 255}, // бирюзовый
 };
+
+std::vector<Band> load_bands(const char *path) {
+  std::vector<Band> b;
+  FILE *f = std::fopen(path, "r");
+  if (!f) {
+    std::cerr << "warn: no " << path << ", using built-in plan\n";
+    // built-in fallback: РФ частотный план
+    b = {
+      {"LW", 100000.0, 300000.0, {100,200,255,255}},
+      {"MW/BC", 300000.0, 3'000'000.0, {100,200,255,255}},
+      {"HF", 3'000'000.0, 30'000'000.0, {100,200,255,255}},
+      {"50MHz", 50'000'000.0, 54'000'000.0, {120,230,140,255}},
+      {"FM", 88'000'000.0, 108'000'000.0, {255,160,40,255}},
+      {"Air", 118'000'000.0, 137'000'000.0, {180,180,255,255}},
+      {"Satcom", 137'000'000.0, 144'000'000.0, {160,120,255,255}},
+      {"2m", 144'000'000.0, 148'000'000.0, {120,230,140,255}},
+      {"148-174", 148'000'000.0, 174'000'000.0, {120,230,140,255}},
+      {"Satcom", 230'000'000.0, 270'000'000.0, {160,120,255,255}},
+      {"300-308", 300'000'000.0, 308'000'000.0, {200,180,140,255}},
+      {"400-470", 400'000'000.0, 470'000'000.0, {120,230,140,255}},
+      {"70cm", 420'000'000.0, 450'000'000.0, {120,230,140,255}},
+      {"GSM900", 880'000'000.0, 960'000'000.0, {200,180,140,255}},
+      {"GSM1800", 1'710'000'000.0, 1'880'000'000.0, {200,180,140,255}},
+    };
+    return b;
+  }
+  int ci = 0;
+  char line[256];
+  while (fgets(line, sizeof(line), f)) {
+    if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+    char name[64]; double s, e;
+    if (std::sscanf(line, "%lf %lf %63[^\n]", &s, &e, name) >= 3) {
+      b.push_back({name, s * 1e6, e * 1e6, band_colors[ci % 10]});
+      ci++;
+    }
+  }
+  fclose(f);
+  return b;
+}
 
 struct DetectedSignal {
   double freq_hz;
@@ -106,6 +148,7 @@ class RingBuffer {
 
 public:
   RingBuffer(size_t s) : buffer(s), size(s) {}
+  void reset() { read_pos.store(0); write_pos.store(0); }
 
   size_t available_read() const {
     size_t wp = write_pos.load(std::memory_order_acquire);
@@ -208,17 +251,72 @@ std::atomic<double> pip_center_freq{0.0};
 std::atomic<bool> full_main_complete{false};
 std::atomic<bool> this_step_is_pip{false};
 
-std::atomic<int> sdr_gain{INITIAL_GAIN};
+std::atomic<int> sdr_gain{32};
 std::atomic<bool> gain_changed{false};
+
+constexpr size_t IQ_BYTES_PER_BLOCK = FFT_SIZE * 2;
+
 
 // === Утилиты ===
 float u8_to_float(uint8_t v) { return ((float)v - 127.5f) / 128.0f; }
 
-std::vector<float> make_hann_window(size_t N) {
+std::vector<float> make_window(size_t N, int type) {
   std::vector<float> w(N);
-  for (size_t i = 0; i < N; ++i)
-    w[i] = 0.5f * (1.0f - std::cos(2.0f * M_PI * (float)i / (float)(N - 1)));
+  for (size_t i = 0; i < N; ++i) {
+    float a = 2.0f * M_PI * (float)i / (float)(N - 1);
+    float v = 0;
+    switch (type) {
+      case 0: // Hann
+        v = 0.5f * (1.0f - std::cos(a));
+        break;
+      case 1: // Hamming
+        v = 0.53836f - 0.46164f * std::cos(a);
+        break;
+      case 2: // Blackman
+        v = 0.42f - 0.5f * std::cos(a) + 0.08f * std::cos(2.0f * a);
+        break;
+      case 3: // Blackman-Harris
+        v = 0.35875f - 0.48829f * std::cos(a) + 0.14128f * std::cos(2.0f * a) -
+            0.01168f * std::cos(3.0f * a);
+        break;
+      case 4: // Kaiser (approx beta=6)
+        {
+          float beta = 6.0f;
+          float t = (2.0f * (float)i / (float)(N - 1) - 1.0f);
+          float x = 1.0f - t * t;
+          // I0(x) ~ poly approx
+          float vv = 1.0f;
+          float term = 1.0f;
+          for (int k = 1; k <= 10; ++k) {
+            term *= (x * beta * beta / 4.0f) / ((float)(k * k));
+            vv += term;
+          }
+          v = vv / 67.0f; // I0(beta) ~ 67
+        }
+        break;
+      default:
+        v = 0.5f * (1.0f - std::cos(a));
+    }
+    w[i] = v;
+  }
   return w;
+}
+
+float compute_window_sum_sq(const std::vector<float> &w) {
+  float s = 0;
+  for (float v : w) s += v * v;
+  return s;
+}
+
+const char* window_name(int type) {
+  switch (type) {
+    case 0: return "Hann";
+    case 1: return "Hamming";
+    case 2: return "Blackman";
+    case 3: return "Blackman-Harris";
+    case 4: return "Kaiser(b6)";
+    default: return "Hann";
+  }
 }
 
 float lin_to_db(float x) { return 10.0f * std::log10(std::max(x, 1e-30f)); }
@@ -290,8 +388,9 @@ void print_help() {
       << "M           : межцикловое IIR сглаживание\n"
       << "N           : линия шумового пола\n"
       << "D           : детекция сигналов (CFAR)\n"
-      << "+ / -       : gain\n"
+      << "+ / -       : gain (или Tab > слайдер)\n"
       << "1..9        : быстрый выбор бэнда\n"
+      << "Tab         : панель настроек\n"
       << "F1 / ?      : справка\n"
       << "Q / Esc     : выход\n\n";
 }
@@ -318,6 +417,7 @@ void sdr_worker() {
   usleep(10000);
 
   bool alternate = false;
+  double last_freq = 0;
   std::vector<uint8_t> block(FFT_SIZE * 2);
 
   while (worker_running.load()) {
@@ -333,7 +433,7 @@ void sdr_worker() {
       next_center = pip_center_freq.load();
       do_pip = true;
     } else {
-      next_center = main_center + SCAN_STEP;
+      next_center = main_center + scan_step();
       if (next_center > e || next_center < s) {
         next_center = s;
         full_main_complete.store(true);
@@ -341,7 +441,10 @@ void sdr_worker() {
       main_center = next_center;
     }
 
-    rtlsdr_set_center_freq(sdr.dev, (uint32_t)next_center);
+    if (std::abs(next_center - last_freq) > 1.0) {
+      rtlsdr_set_center_freq(sdr.dev, (uint32_t)next_center);
+      last_freq = next_center;
+    }
     current_center_freq.store(next_center);
     this_step_is_pip.store(do_pip);
     usleep(1000);
@@ -374,12 +477,12 @@ int main() {
     return 1;
   }
 
-  auto window_func = make_hann_window(FFT_SIZE);
-  float win_sum_sq = 0.0f;
-  for (float v : window_func) win_sum_sq += v * v;
+  auto window_func = make_window(FFT_SIZE, window_type);
+  float win_sum_sq = compute_window_sum_sq(window_func);
 
   const double bin_width = (double)SAMPLE_RATE / FFT_SIZE;
-  const float fft_norm = 1.0f / (win_sum_sq * (float)bin_width);
+  float fft_norm = 1.0f / (win_sum_sq * (float)bin_width);
+  int last_window_type = window_type;
 
   std::vector<liquid_float_complex> fft_in(FFT_SIZE), fft_out(FFT_SIZE);
   FFTPlanWrapper fft_wrapper(FFT_SIZE, fft_in, fft_out);
@@ -391,19 +494,21 @@ int main() {
 
   std::thread worker_thread(sdr_worker);
 
+  auto bands = load_bands("freqplan.txt");
+
   size_t total_bins =
       (size_t)std::ceil((SCAN_END_FREQ - SCAN_START_FREQ) / bin_width);
   std::vector<float> cycle_psd_sum(total_bins, 0.0f);
   std::vector<int> cycle_count(total_bins, 0);
-  std::vector<float> display_scan(total_bins, MIN_DB - 100.0f);
-  std::vector<float> display_peak(total_bins, MIN_DB - 100.0f);
+  std::vector<float> display_scan(total_bins, display_min_db - 100.0f);
+  std::vector<float> display_peak(total_bins, display_min_db - 100.0f);
   bool peak_hold = false;
   bool smoothing_enabled = true;
   bool show_noise_floor = false;
   bool detection_enabled = false;
 
   std::vector<DetectedSignal> signals;
-  float noise_floor_db = MIN_DB;
+  float noise_floor_db = display_min_db;
   Uint32 last_detect_ms = 0;
 
   SDL_Window *win = SDL_CreateWindow(
@@ -453,12 +558,94 @@ int main() {
   const double MAX_SPAN = SCAN_END_FREQ - SCAN_START_FREQ;
   std::vector<uint8_t> rbuf(FFT_SIZE * 2);
   std::vector<float> samp_I(FFT_SIZE), samp_Q(FFT_SIZE);
-  std::vector<float> px_db(WINDOW_WIDTH, MIN_DB - 100.0f);
+  std::vector<float> px_db(WINDOW_WIDTH, display_min_db - 100.0f);
+
+  // FM демодуляция (в отдельном потоке — объявлен ниже)
 
   update_scan_range_from_display();
 
   double prev_scan_s = SCAN_START_FREQ, prev_scan_e = SCAN_END_FREQ;
   bool prev_pip = false;
+  bool show_settings = false;
+  UIDragState ui_drag{0, 0, false, false, false};
+  int band_zone_y = WINDOW_HEIGHT - SCALE_HEIGHT - BAND_ZONE_HEIGHT;
+
+  // === UI (settings panel) ===
+  int panel_w = 320;
+  int panel_x = WINDOW_WIDTH - panel_w - 10;
+  int panel_y = 10;
+  int row_h = 26;
+  int slider_w = 180;
+
+  // Прокси-значения для UI (т.к. sliders работают с float*, а нам нужны int/bool/atomic)
+  float ui_gain = 32.0f;
+  float ui_overlap_pct = (float)(overlap * 100);
+  float ui_edge_pct = edge_reject_frac * 100;
+  int ui_window_type = window_type;
+  bool ui_pip_enabled = pip_mode.load();
+
+  UIPanel settings_panel;
+  settings_panel.rect = {panel_x, panel_y, panel_w, 350};
+  settings_panel.title = "Settings (Tab)";
+
+  UISlider slider_gain;
+  slider_gain.rect = {panel_x + 20, panel_y + 40, slider_w, row_h};
+  slider_gain.label = "Gain";
+  slider_gain.value = &ui_gain;
+  slider_gain.min_val = 0;
+  slider_gain.max_val = 496;
+  slider_gain.step = 10;
+
+  UISlider slider_min_db;
+  slider_min_db.rect = {panel_x + 20, panel_y + 90, slider_w, row_h};
+  slider_min_db.label = "Min dBm";
+  slider_min_db.value = &display_min_db;
+  slider_min_db.min_val = -120;
+  slider_min_db.max_val = -10;
+  slider_min_db.step = 1;
+
+  UISlider slider_max_db;
+  slider_max_db.rect = {panel_x + 20, panel_y + 140, slider_w, row_h};
+  slider_max_db.label = "Max dBm";
+  slider_max_db.value = &display_max_db;
+  slider_max_db.min_val = -100;
+  slider_max_db.max_val = 20;
+  slider_max_db.step = 1;
+
+  UISlider slider_overlap;
+  slider_overlap.rect = {panel_x + 20, panel_y + 190, slider_w, row_h};
+  slider_overlap.label = "Overlap %";
+  slider_overlap.value = &ui_overlap_pct;
+  slider_overlap.min_val = 0;
+  slider_overlap.max_val = 45;
+  slider_overlap.step = 1;
+
+  UISlider slider_edge;
+  slider_edge.rect = {panel_x + 20, panel_y + 240, slider_w, row_h};
+  slider_edge.label = "Edge reject %";
+  slider_edge.value = &ui_edge_pct;
+  slider_edge.min_val = 0;
+  slider_edge.max_val = 25;
+  slider_edge.step = 1;
+
+  UISelect sel_window;
+  sel_window.rect = {panel_x + 20, panel_y + 290, slider_w, row_h};
+  sel_window.label = "Window";
+  sel_window.value = &ui_window_type;
+  sel_window.options = {"Hann", "Hamming", "Blackman", "Bl-Harris", "Kaiser"};
+
+  UIToggle toggle_pip;
+  toggle_pip.rect = {panel_x + 220, panel_y + 40, 40, row_h};
+  toggle_pip.label = "PiP";
+  toggle_pip.value = &ui_pip_enabled;
+
+  settings_panel.add(&slider_gain);
+  settings_panel.add(&slider_min_db);
+  settings_panel.add(&slider_max_db);
+  settings_panel.add(&slider_overlap);
+  settings_panel.add(&slider_edge);
+  settings_panel.add(&sel_window);
+  settings_panel.add(&toggle_pip);
 
   const SDL_Color COL_WHITE{255, 255, 255, 255};
   const SDL_Color COL_YELLOW{255, 230, 80, 255};
@@ -524,7 +711,7 @@ int main() {
           if (psd > max_psd) max_psd = psd;
         }
         float db = lin_to_db(max_psd);
-        float n = std::clamp((db - MIN_DB) / (MAX_DB - MIN_DB), 0.0f, 1.0f);
+        float n = std::clamp((db - display_min_db) / (display_max_db - display_min_db), 0.0f, 1.0f);
         Uint8 r, g, b;
         classic_gradient(n, r, g, b);
         line[px] = (255U << 24) | (r << 16) | (g << 8) | b;
@@ -533,8 +720,8 @@ int main() {
       pip_waterfall_lines[pip_top] = std::move(line);
     } else {
       // Main: накопление + edge rejection + IIR между циклами
-      const size_t edge = (size_t)(FFT_SIZE * EDGE_REJECT_FRAC);
-      const float alpha = smoothing_enabled ? SMOOTH_ALPHA : 1.0f;
+      const size_t edge = (size_t)(FFT_SIZE * edge_reject_frac);
+      const float alpha = smoothing_enabled ? smooth_alpha : 1.0f;
       for (size_t k = edge; k < FFT_SIZE - edge; ++k) {
         float re = fft_out[k].real, im = fft_out[k].imag;
         float psd = (re * re + im * im) * fft_norm;
@@ -546,7 +733,7 @@ int main() {
         cycle_psd_sum[idx] += psd;
         cycle_count[idx]++;
         float avg_db = lin_to_db(cycle_psd_sum[idx] / cycle_count[idx]);
-        if (display_scan[idx] <= MIN_DB - 99.0f)
+        if (display_scan[idx] <= display_min_db - 99.0f)
           display_scan[idx] = avg_db;
         else
           display_scan[idx] =
@@ -564,17 +751,17 @@ int main() {
       for (auto &v : display_peak) v -= PEAK_DECAY_DB;
 
     std::vector<Uint32> line(WINDOW_WIDTH, 0);
-    const float range = MAX_DB - MIN_DB;
+    const float range = display_max_db - display_min_db;
     double span = display_end_freq - display_start_freq;
     for (int x = 0; x < WINDOW_WIDTH; ++x) {
       double f_lo = display_start_freq + (double)x / WINDOW_WIDTH * span;
       double f_hi = display_start_freq + (double)(x + 1) / WINDOW_WIDTH * span;
       size_t lo = (size_t)std::floor((f_lo - SCAN_START_FREQ) / bin_width);
       size_t hi = (size_t)std::ceil((f_hi - SCAN_START_FREQ) / bin_width);
-      float db = MIN_DB - 100.0f;
+      float db = display_min_db - 100.0f;
       for (size_t i = lo; i < hi && i < total_bins; ++i)
         db = std::max(db, display_scan[i]);
-      float n = std::clamp((db - MIN_DB) / range, 0.0f, 1.0f);
+      float n = std::clamp((db - display_min_db) / range, 0.0f, 1.0f);
       Uint8 r, g, b;
       classic_gradient(n, r, g, b);
       line[x] = (255U << 24) | (r << 16) | (g << 8) | b;
@@ -622,7 +809,7 @@ int main() {
       if (cnt == 0) continue;
       float mean = sum / cnt;
       if (px_db[px] > mean + CFAR_THRESHOLD_DB &&
-          px_db[px] > MIN_DB + 2.0f)
+          px_db[px] > display_min_db + 2.0f)
         is_peak[px] = true;
     }
 
@@ -679,6 +866,14 @@ int main() {
     if (!worker_running.load() && sample_buffer.available_read() < rbuf.size())
       break;
 
+    // === 0. Проверка изменения окна ===
+    if (window_type != last_window_type) {
+      last_window_type = window_type;
+      window_func = make_window(FFT_SIZE, window_type);
+      win_sum_sq = compute_window_sum_sq(window_func);
+      fft_norm = 1.0f / (win_sum_sq * (float)bin_width);
+    }
+
     // === 1. FFT batch-ом ===
     int processed = 0;
     while (processed < MAX_FFT_PER_FRAME &&
@@ -715,13 +910,21 @@ int main() {
           display_total_hz = display_end_freq - display_start_freq;
         }
       } else if (e.type == SDL_MOUSEBUTTONDOWN) {
-        if (e.button.button == SDL_BUTTON_RIGHT) {
+        bool on_panel = show_settings &&
+            e.button.x >= settings_panel.rect.x &&
+            e.button.x < settings_panel.rect.x + settings_panel.rect.w &&
+            e.button.y >= settings_panel.rect.y &&
+            e.button.y < settings_panel.rect.y + settings_panel.rect.h;
+        if (e.button.button == SDL_BUTTON_RIGHT && !on_panel) {
           dragging = true;
           drag_x0 = e.button.x;
           drag_start0 = display_start_freq;
           drag_end0 = display_end_freq;
         } else if (e.button.button == SDL_BUTTON_LEFT) {
-          if (e.button.y > WINDOW_HEIGHT - SCALE_HEIGHT) {
+          if (on_panel) {
+            // consumed by UI panel
+          } else if (e.button.y >= band_zone_y &&
+                     e.button.y < band_zone_y + BAND_ZONE_HEIGHT) {
             double f = display_start_freq +
                        (double)e.button.x / WINDOW_WIDTH * display_total_hz;
             for (const auto &b : bands) {
@@ -746,27 +949,35 @@ int main() {
       } else if (e.type == SDL_MOUSEBUTTONUP) {
         if (e.button.button == SDL_BUTTON_RIGHT) dragging = false;
       } else if (e.type == SDL_MOUSEWHEEL) {
-        double cur_f = display_start_freq +
-                       (double)mouse_x / WINDOW_WIDTH * display_total_hz;
-        double span = display_end_freq - display_start_freq;
-        double z = shift ? 0.9 : 0.7;
-        double zf = (e.wheel.y > 0) ? z : 1.0 / z;
-        double new_span = std::clamp(span * zf, MIN_SPAN, MAX_SPAN);
-        double ratio = (cur_f - display_start_freq) / span;
-        display_start_freq = cur_f - ratio * new_span;
-        display_end_freq = display_start_freq + new_span;
-        if (display_start_freq < SCAN_START_FREQ) {
-          display_start_freq = SCAN_START_FREQ;
-          display_end_freq = SCAN_START_FREQ + new_span;
+        bool on_panel = show_settings &&
+            mouse_x >= settings_panel.rect.x &&
+            mouse_x < settings_panel.rect.x + settings_panel.rect.w &&
+            mouse_y >= settings_panel.rect.y &&
+            mouse_y < settings_panel.rect.y + settings_panel.rect.h;
+        if (!on_panel) {
+          double cur_f = display_start_freq +
+                         (double)mouse_x / WINDOW_WIDTH * display_total_hz;
+          double span = display_end_freq - display_start_freq;
+          double z = shift ? 0.9 : 0.7;
+          double zf = (e.wheel.y > 0) ? z : 1.0 / z;
+          double new_span = std::clamp(span * zf, MIN_SPAN, MAX_SPAN);
+          double ratio = (cur_f - display_start_freq) / span;
+          display_start_freq = cur_f - ratio * new_span;
+          display_end_freq = display_start_freq + new_span;
+          if (display_start_freq < SCAN_START_FREQ) {
+            display_start_freq = SCAN_START_FREQ;
+            display_end_freq = SCAN_START_FREQ + new_span;
+          }
+          if (display_end_freq > SCAN_END_FREQ) {
+            display_end_freq = SCAN_END_FREQ;
+            display_start_freq = SCAN_END_FREQ - new_span;
+          }
+          clamp_display_range();
+          update_scan_range_from_display();
         }
-        if (display_end_freq > SCAN_END_FREQ) {
-          display_end_freq = SCAN_END_FREQ;
-          display_start_freq = SCAN_END_FREQ - new_span;
-        }
-        clamp_display_range();
-        update_scan_range_from_display();
       } else if (e.type == SDL_KEYDOWN) {
-        SDL_Keycode sym = e.key.keysym.sym;
+        auto sc = e.key.keysym.scancode;
+        auto sym = e.key.keysym.sym;
         double scroll = display_total_hz * 0.1;
 
         if (sym == SDLK_LEFT) {
@@ -794,7 +1005,7 @@ int main() {
           display_end_freq = SCAN_END_FREQ;
           clamp_display_range();
           update_scan_range_from_display();
-        } else if (sym == SDLK_p) {
+        } else if (sc == SDL_SCANCODE_P) {
           bool nm = !pip_mode.load();
           pip_mode.store(nm);
           if (nm) {
@@ -805,19 +1016,19 @@ int main() {
               std::fill(l.begin(), l.end(), 0U);
             pip_top = 0;
           }
-        } else if (sym == SDLK_h) {
+        } else if (sc == SDL_SCANCODE_H) {
           peak_hold = !peak_hold;
           if (peak_hold)
             std::fill(display_peak.begin(), display_peak.end(),
-                      MIN_DB - 100.0f);
-        } else if (sym == SDLK_c) {
+                      display_min_db - 100.0f);
+        } else if (sc == SDL_SCANCODE_C) {
           std::fill(display_peak.begin(), display_peak.end(),
-                    MIN_DB - 100.0f);
-        } else if (sym == SDLK_m) {
+                    display_min_db - 100.0f);
+        } else if (sc == SDL_SCANCODE_M) {
           smoothing_enabled = !smoothing_enabled;
-        } else if (sym == SDLK_n) {
+        } else if (sc == SDL_SCANCODE_N) {
           show_noise_floor = !show_noise_floor;
-        } else if (sym == SDLK_d) {
+        } else if (sc == SDL_SCANCODE_D) {
           detection_enabled = !detection_enabled;
           if (!detection_enabled) signals.clear();
         } else if (sym == SDLK_PLUS || sym == SDLK_EQUALS ||
@@ -830,8 +1041,11 @@ int main() {
             sdr_gain.store(std::max(0, g - 10));
             gain_changed.store(true);
           }
-        } else if (sym == SDLK_ESCAPE || sym == SDLK_q) {
-          quit = true;
+        } else if (sc == SDL_SCANCODE_TAB) {
+          show_settings = !show_settings;
+        } else if (sc == SDL_SCANCODE_ESCAPE || sym == SDLK_q) {
+          if (show_settings) show_settings = false;
+          else quit = true;
         } else if (sym == SDLK_F1 || sym == SDLK_SLASH) {
           print_help();
         } else if (sym >= SDLK_1 && sym <= SDLK_9) {
@@ -877,7 +1091,7 @@ int main() {
                     (double)(x + 1) / WINDOW_WIDTH * display_total_hz;
       size_t lo = (size_t)std::floor((f_lo - SCAN_START_FREQ) / bin_width);
       size_t hi = (size_t)std::ceil((f_hi - SCAN_START_FREQ) / bin_width);
-      float db = MIN_DB - 100.0f;
+      float db = display_min_db - 100.0f;
       for (size_t i = lo; i < hi && i < total_bins; ++i)
         db = std::max(db, src[i]);
       return db;
@@ -894,7 +1108,7 @@ int main() {
       last_detect_ms = now;
     }
 
-    const float db_range = MAX_DB - MIN_DB;
+    const float db_range = display_max_db - display_min_db;
 
     // --- Фон ---
     SDL_SetRenderDrawColor(renderer, 12, 16, 24, 255);
@@ -929,27 +1143,25 @@ int main() {
     // Линия шумового пола
     if (show_noise_floor) {
       float nf_norm =
-          std::clamp((noise_floor_db - MIN_DB) / db_range, 0.0f, 1.0f);
+          std::clamp((noise_floor_db - display_min_db) / db_range, 0.0f, 1.0f);
       int y = (int)(SPECTRUM_HEIGHT - nf_norm * SPECTRUM_HEIGHT);
       SDL_SetRenderDrawColor(renderer, 80, 200, 120, 160);
       for (int x = 0; x < WINDOW_WIDTH; x += 3)
         SDL_RenderDrawPoint(renderer, x, y);
     }
 
-    // --- Спектр: заливка градиентом + кромка ---
+    // --- Спектр: заливка + линия ---
+    SDL_SetRenderDrawColor(renderer, 60, 120, 220, 80);
     for (int x = 0; x < WINDOW_WIDTH; ++x) {
-      float n = std::clamp((px_db[x] - MIN_DB) / db_range, 0.0f, 1.0f);
+      float n = std::clamp((px_db[x] - display_min_db) / db_range, 0.0f, 1.0f);
       int y = (int)(SPECTRUM_HEIGHT - n * SPECTRUM_HEIGHT);
-      Uint8 r, g, b;
-      classic_gradient(n, r, g, b);
-      SDL_SetRenderDrawColor(renderer, r, g, b, 140);
       SDL_RenderDrawLine(renderer, x, y, x, SPECTRUM_HEIGHT);
     }
-    SDL_SetRenderDrawColor(renderer, 230, 240, 255, 220);
+    SDL_SetRenderDrawColor(renderer, 180, 220, 255, 210);
     {
       int prev_y = SPECTRUM_HEIGHT;
       for (int x = 0; x < WINDOW_WIDTH; ++x) {
-        float n = std::clamp((px_db[x] - MIN_DB) / db_range, 0.0f, 1.0f);
+        float n = std::clamp((px_db[x] - display_min_db) / db_range, 0.0f, 1.0f);
         int y = (int)(SPECTRUM_HEIGHT - n * SPECTRUM_HEIGHT);
         if (x > 0) SDL_RenderDrawLine(renderer, x - 1, prev_y, x, y);
         prev_y = y;
@@ -962,7 +1174,7 @@ int main() {
       int prev_y = SPECTRUM_HEIGHT;
       for (int x = 0; x < WINDOW_WIDTH; ++x) {
         float db = peak_db_at(display_peak, x);
-        float n = std::clamp((db - MIN_DB) / db_range, 0.0f, 1.0f);
+        float n = std::clamp((db - display_min_db) / db_range, 0.0f, 1.0f);
         int y = (int)(SPECTRUM_HEIGHT - n * SPECTRUM_HEIGHT);
         if (x > 0) SDL_RenderDrawLine(renderer, x - 1, prev_y, x, y);
         prev_y = y;
@@ -974,7 +1186,7 @@ int main() {
       char lbl[16];
       for (int i = 0; i <= DB_STEPS; ++i) {
         float frac = (float)i / DB_STEPS;
-        float db = MAX_DB - frac * db_range;
+        float db = display_max_db - frac * db_range;
         int y = std::clamp((int)(frac * SPECTRUM_HEIGHT) - 6, 0,
                            SPECTRUM_HEIGHT - 12);
         std::snprintf(lbl, sizeof(lbl), "%.0f", db);
@@ -990,7 +1202,7 @@ int main() {
         if (s.freq_hz < display_start_freq || s.freq_hz > display_end_freq)
           continue;
         int x = freq_to_px(s.freq_hz);
-        float n = std::clamp((s.peak_db - MIN_DB) / db_range, 0.0f, 1.0f);
+        float n = std::clamp((s.peak_db - display_min_db) / db_range, 0.0f, 1.0f);
         int y = (int)(SPECTRUM_HEIGHT - n * SPECTRUM_HEIGHT);
         // Треугольник вершиной вниз над пиком
         SDL_SetRenderDrawColor(renderer, 255, 80, 80, 230);
@@ -1067,6 +1279,13 @@ int main() {
                          SPECTRUM_HEIGHT + WATERFALL_HEIGHT);
     }
 
+    // Бэнд-зона под шкалой (фон)
+    SDL_SetRenderDrawColor(renderer, 25, 32, 44, 255);
+    SDL_Rect band_zone_rect{0, band_zone_y, WINDOW_WIDTH, BAND_ZONE_HEIGHT};
+    SDL_RenderFillRect(renderer, &band_zone_rect);
+    SDL_SetRenderDrawColor(renderer, 50, 60, 75, 255);
+    SDL_RenderDrawLine(renderer, 0, band_zone_y, WINDOW_WIDTH, band_zone_y);
+
     // Шкала
     SDL_SetRenderDrawColor(renderer, 30, 38, 50, 255);
     SDL_Rect scale_rect{0, WINDOW_HEIGHT - SCALE_HEIGHT, WINDOW_WIDTH,
@@ -1096,36 +1315,40 @@ int main() {
       }
     }
 
-    if (font) {
-      for (const auto &band : bands) {
-        double bs = band.start_hz / 1e6;
-        double be = band.end_hz / 1e6;
-        if (be < start_mhz || bs > end_mhz) continue;
-        double is = std::max(bs, start_mhz);
-        double ie = std::min(be, end_mhz);
-        if (ie <= is) continue;
-        double px_w = (ie - is) / display_total_mhz * WINDOW_WIDTH;
-        if (px_w < 20.0) continue;
-        int x = freq_to_px((is + ie) / 2 * 1e6);
-        if (x < 0 || x >= WINDOW_WIDTH) continue;
+    // Бэнды в кликабельной зоне с цветами
+    for (const auto &band : bands) {
+      double bs = band.start_hz / 1e6;
+      double be = band.end_hz / 1e6;
+      if (be < start_mhz || bs > end_mhz) continue;
+      double is = std::max(bs, start_mhz);
+      double ie = std::min(be, end_mhz);
+      if (ie <= is) continue;
+      int x1 = freq_to_px(is * 1e6);
+      int x2 = freq_to_px(ie * 1e6);
+      if (x2 <= x1) continue;
+      // цветной прямоугольник фона
+      SDL_SetRenderDrawColor(renderer, band.color.r, band.color.g, band.color.b, 60);
+      SDL_Rect r{x1, band_zone_y, x2 - x1, BAND_ZONE_HEIGHT};
+      SDL_RenderFillRect(renderer, &r);
+      if (font) {
+        int x = (x1 + x2) / 2;
         int tw, th;
-        if (!text_cache.measure(band.name.c_str(), COL_ORANGE, tw, th))
-          continue;
-        if (x - tw / 2 < 0 || x + tw / 2 > WINDOW_WIDTH) continue;
-        int y = WINDOW_HEIGHT - SCALE_HEIGHT - th - 2;
-        text_cache.render(band.name.c_str(), COL_ORANGE, x - tw / 2, y);
+        if (text_cache.measure(band.name.c_str(), band.color, tw, th)) {
+          if (tw < x2 - x1 - 4)
+            text_cache.render(band.name.c_str(), band.color, x - tw / 2, band_zone_y + 1);
+        }
       }
     }
 
     // Tooltip: частота + dB (+SNR если есть детекция)
     if (mouse_x >= 0 && mouse_x < WINDOW_WIDTH && mouse_y >= 0 &&
-        mouse_y < WINDOW_HEIGHT - SCALE_HEIGHT) {
+        mouse_y < band_zone_y) {
       double f = display_start_freq +
                  (double)mouse_x / WINDOW_WIDTH * display_total_hz;
       size_t idx = (size_t)std::round((f - SCAN_START_FREQ) / bin_width);
-      float db = (idx < total_bins) ? display_scan[idx] : MIN_DB - 100.0f;
+      float db = (idx < total_bins) ? display_scan[idx] : display_min_db - 100.0f;
       char t[96];
-      if (db <= MIN_DB - 99.0f)
+      if (db <= display_min_db - 99.0f)
         std::snprintf(t, sizeof(t), "%.3f MHz", f / 1e6);
       else if (show_noise_floor || detection_enabled)
         std::snprintf(t, sizeof(t), "%.3f MHz  %.1f dB  SNR %.1f", f / 1e6, db,
@@ -1148,9 +1371,10 @@ int main() {
       char info[320];
       std::snprintf(info, sizeof(info),
                     "Disp: %.1f-%.1f MHz  Ctr: %.1f  G: %d  "
-                    "NF: %.1f dB  PiP:%s Peak:%s Sm:%s NF:%s Det:%s",
+                    "NF: %.1f dB  Win:%s  Ovl:%d%%  PiP:%s Peak:%s Sm:%s NF:%s Det:%s",
                     start_mhz, end_mhz, current_center_freq.load() / 1e6,
                     sdr_gain.load(), noise_floor_db,
+                    window_name(window_type), (int)(overlap * 100),
                     pip_mode.load() ? "+" : "-",
                     peak_hold ? "+" : "-",
                     smoothing_enabled ? "+" : "-",
@@ -1168,6 +1392,43 @@ int main() {
         std::snprintf(c, sizeof(c), "Signals: %zu", signals.size());
         text_cache.render(c, COL_GREEN, 10, 8 + th + 6);
       }
+    }
+
+    // === Settings panel ===
+    {
+      // Синхронизация UI прокси -> реальные переменные
+      int new_gain = (int)std::round(ui_gain / 10.0f) * 10;
+      new_gain = std::clamp(new_gain, 0, 496);
+      if (new_gain != sdr_gain.load()) {
+        sdr_gain.store(new_gain);
+        gain_changed.store(true);
+      }
+
+      overlap = ui_overlap_pct / 100.0;
+      edge_reject_frac = ui_edge_pct / 100.0;
+      window_type = ui_window_type;
+
+      ui_pip_enabled = pip_mode.load();
+
+      bool left_down = (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
+      bool mouse_clicked = left_down && !ui_drag.prev_mouse_down;
+      ui_drag.prev_mouse_down = left_down;
+
+      UIContext uictx{font, renderer, mouse_x, mouse_y, left_down, mouse_clicked, KMOD_NONE, &ui_drag};
+      if (show_settings) {
+        settings_panel.visible = true;
+
+        if (left_down && !ui_drag.held) {
+          SDL_GetMouseState(&uictx.mouse_x, &uictx.mouse_y);
+        }
+
+        settings_panel.handle(uictx);
+        settings_panel.draw(uictx);
+      } else {
+        settings_panel.visible = false;
+      }
+
+      if (!left_down) ui_drag.held = false;
     }
 
     SDL_RenderPresent(renderer);
